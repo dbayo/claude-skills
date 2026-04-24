@@ -2,9 +2,9 @@
 name: bayo-magic-link-auth
 description: >
   Añade autenticación passwordless con magic link a un proyecto Phoenix (Elixir).
-  Genera el sistema completo: registro por email, login con link temporal (15 min),
-  sesiones con remember me (14 días), sudo mode para acciones sensibles y emails
-  via Swoosh. El usuario no necesita contraseña para acceder.
+  Genera el sistema completo: una sola vista unificada de acceso/registro (patrón Notion/Linear),
+  login con link temporal (15 min), sesiones con remember me (14 días), sudo mode para acciones
+  sensibles y emails via Swoosh. El usuario no necesita contraseña para acceder.
   Usar cuando el usuario diga "magic link", "login por email", "autenticación sin contraseña",
   "passwordless", "añadir auth", "sistema de login", "phx.gen.auth".
   Compatible con Phoenix 1.7+. Opcionalmente puede añadirse soporte de contraseña tradicional.
@@ -13,8 +13,10 @@ description: >
 # bayo-magic-link-auth
 
 Configura un sistema de autenticación completo basado en magic links para Phoenix:
-el usuario introduce su email, recibe un link de un solo uso válido 15 minutos,
-y al hacer click queda autenticado. Sin contraseñas obligatorias.
+una sola vista unificada de acceso — si el email no existe se crea la cuenta automáticamente,
+si existe se envía el link directamente. El usuario introduce su email, recibe un link
+de un solo uso válido 15 minutos, y al hacer click queda autenticado. Sin contraseñas
+obligatorias. Patrón idéntico al que usan Notion y Linear.
 
 ---
 
@@ -54,7 +56,7 @@ Esto crea:
 - `lib/<app>/accounts/user_notifier.ex` (emails)
 - `lib/<app>_web/user_auth.ex` (plugs)
 - `lib/<app>_web/controllers/user_session_controller.ex`
-- `lib/<app>_web/controllers/user_registration_controller.ex`
+- `lib/<app>_web/controllers/user_registration_controller.ex` ← **se eliminará en paso 5**
 - `lib/<app>_web/controllers/user_settings_controller.ex`
 - Templates en `lib/<app>_web/controllers/*_html/`
 - `test/support/fixtures/accounts_fixtures.ex`
@@ -179,9 +181,17 @@ def deliver_login_instructions(%User{} = user, magic_link_url_fun) do
 end
 ```
 
-### 5. Configurar el controlador de sesión
+### 5. Unificar acceso y registro — eliminar UserRegistrationController
 
-En `lib/<app>_web/controllers/user_session_controller.ex`, verifica que `create/2` maneje los tres casos:
+**Elimina** el controlador de registro generado y sus templates, ya que no se usarán:
+
+```bash
+rm lib/<app>_web/controllers/user_registration_controller.ex
+rm lib/<app>_web/controllers/user_registration_html.ex
+rm -r lib/<app>_web/controllers/user_registration_html/
+```
+
+En `lib/<app>_web/controllers/user_session_controller.ex`, actualiza `create/2` para que maneje los tres casos. El caso clave es el del magic link: si el email no existe, se crea el usuario automáticamente antes de enviar el link:
 
 ```elixir
 # Caso 1: Magic link recibido por email (token en params)
@@ -211,14 +221,23 @@ def create(conn, %{"user" => %{"email" => email, "password" => password} = user_
   end
 end
 
-# Caso 3: Solo email → enviar magic link
+# Caso 3: Solo email → acceso o registro unificado
+# Si el usuario existe → envía magic link; si no existe → crea la cuenta y envía el link
 def create(conn, %{"user" => %{"email" => email}}) do
-  if user = Accounts.get_user_by_email(email) do
+  user =
+    Accounts.get_user_by_email(email) ||
+      case Accounts.register_user(%{"email" => email}) do
+        {:ok, new_user} -> new_user
+        {:error, _} -> nil
+      end
+
+  if user do
     Accounts.deliver_login_instructions(user, &url(~p"/users/log-in/#{&1}"))
   end
-  # Siempre responde igual para no enumerar usuarios
+
+  # Siempre responde igual — no revelar si el email existía o no
   conn
-  |> put_flash(:info, "If your email is in our system, you will receive login instructions shortly.")
+  |> put_flash(:info, "Te hemos enviado un enlace de acceso. Revisa tu email.")
   |> redirect(to: ~p"/users/log-in")
 end
 
@@ -237,19 +256,22 @@ end
 
 ### 6. Configurar el template de login
 
-Edita `lib/<app>_web/controllers/user_session_html/new.html.heex` para que tenga dos formularios:
+Edita `lib/<app>_web/controllers/user_session_html/new.html.heex`. La vista es **única** — sin link a "Regístrate" porque la misma página maneja ambos casos:
 
-1. **Magic link** (solo email):
+1. **Magic link** (solo email) — formulario principal:
 ```html
+<h1>Accede o crea tu cuenta</h1>
+<p>Introduce tu email y te enviamos un enlace de acceso instantáneo.</p>
+
 <.simple_form :let={f} for={%{}} as={:user} action={~p"/users/log-in"} method="post">
-  <.input field={f[:email]} type="email" label="Email" required />
+  <.input field={f[:email]} type="email" label="Email" required autofocus />
   <:actions>
-    <.button type="submit">Send magic link</.button>
+    <.button type="submit">Enviar enlace de acceso</.button>
   </:actions>
 </.simple_form>
 ```
 
-2. **Password** (email + password, solo si el proyecto lo soporta):
+2. **Password** (email + password, solo si el proyecto lo soporta — es opcional):
 ```html
 <.simple_form :let={f} for={%{}} as={:user} action={~p"/users/log-in"} method="post">
   <.input field={f[:email]} type="email" label="Email" required />
@@ -260,6 +282,8 @@ Edita `lib/<app>_web/controllers/user_session_html/new.html.heex` para que tenga
   </:actions>
 </.simple_form>
 ```
+
+> No añadas un link "¿No tienes cuenta? Regístrate" — es innecesario y confunde al usuario.
 
 Crea `lib/<app>_web/controllers/user_session_html/confirm.html.heex` para confirmar el magic link:
 
@@ -279,16 +303,14 @@ Crea `lib/<app>_web/controllers/user_session_html/confirm.html.heex` para confir
 </.simple_form>
 ```
 
-### 7. Añadir ruta de confirmación al router
+### 7. Configurar rutas en el router
 
-En `lib/<app>_web/router.ex`, dentro del scope de auth (sin autenticación requerida):
+En `lib/<app>_web/router.ex`. Sin rutas de `/users/register` — todo pasa por `/users/log-in`:
 
 ```elixir
 scope "/", MyAppWeb do
   pipe_through [:browser, :redirect_if_user_is_authenticated]
 
-  get  "/users/register",          UserRegistrationController, :new
-  post "/users/register",          UserRegistrationController, :create
   get  "/users/log-in",            UserSessionController, :new
   post "/users/log-in",            UserSessionController, :create
   get  "/users/log-in/:token",     UserSessionController, :confirm  # ← magic link
@@ -300,6 +322,8 @@ scope "/", MyAppWeb do
   delete "/users/log-out", UserSessionController, :delete
 end
 ```
+
+Si el generador añadió rutas de `/users/register`, **elimínalas** del router.
 
 ### 8. Configurar emails con Swoosh
 
@@ -416,25 +440,24 @@ mix compile
 mix phx.routes | grep users
 ```
 
-Comprueba que aparezcan:
+Comprueba que aparezcan (sin rutas de `/users/register`):
 ```
 GET    /users/log-in           UserSessionController :new
 POST   /users/log-in           UserSessionController :create
 GET    /users/log-in/:token    UserSessionController :confirm
 DELETE /users/log-out          UserSessionController :delete
-GET    /users/register         UserRegistrationController :new
-POST   /users/register         UserRegistrationController :create
 ```
 
 ### 11. Probar el flujo completo en local
 
 1. Arranca el servidor: `mix phx.server`
-2. Ve a `http://localhost:4000/users/register`
-3. Introduce un email y envía
+2. Ve a `http://localhost:4000/users/log-in`
+3. Introduce un email nuevo (sin cuenta) y envía — debe crearse el usuario y enviar el link
 4. Abre `http://localhost:4000/dev/mailbox` → verás el magic link
 5. Haz click en el link → te lleva a la página de confirmación
 6. Haz click en "Keep me logged in" → autenticado
 7. Verifica logout en `/users/log-out`
+8. Vuelve a `/users/log-in` con el mismo email → debe enviarte otro link (usuario ya existe)
 
 ### 12. Crear PR
 
@@ -453,7 +476,8 @@ gh pr create \
 
 ## Consideraciones importantes
 
-- **No enumerar usuarios**: el endpoint de magic link siempre responde igual (éxito o no) — nunca revelar si el email existe en la BD.
+- **Vista unificada acceso/registro**: una sola página `/users/log-in` — si el email no existe se crea la cuenta antes de enviar el link. No hay `/users/register`. Patrón idéntico al de Notion y Linear.
+- **No enumerar usuarios**: el endpoint siempre responde con el mismo mensaje independientemente de si el email existía o es nuevo.
 - **El token se hashea en BD**: el usuario recibe el token en Base64, en la BD se guarda su SHA256. Si alguien roba la BD, los tokens son inútiles.
 - **Token de un solo uso**: `login_user_by_magic_link/1` elimina el token tras usarlo. No se puede reutilizar.
 - **Remember me**: cookie de 14 días. Sin remember me, la sesión dura hasta cerrar el navegador (token de sesión válido 14 días igualmente, pero la cookie no persiste).
